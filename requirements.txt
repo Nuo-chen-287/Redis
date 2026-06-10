@@ -1,0 +1,5 @@
+# Redis 学习专题依赖
+# 安装：pip install -r requirements.txt
+redis>=5.0.0       # redis-py，官方 Python 客户端
+PyMySQL>=1.1.0     # 纯 Python 的 MySQL 驱动
+DBUtils>=3.0.0     # 提供 PooledDB 连接池（模拟真实 DB 的连接数上限）
