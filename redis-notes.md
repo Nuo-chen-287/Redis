@@ -663,3 +663,864 @@ Part C · 逻辑过期：key 永不物理过期，过期就异步重建，请求
 > 1. Part A 只删了**一个**热点 key 就这么痛。如果是**成千上万**个 key 因为当初设了相同 TTL、在同一秒集体过期呢？（这就是**缓存雪崩**——解法之一：给 TTL 加**随机抖动**，别让大家约好同一刻一起死。这样缓存三大问题 穿透/击穿/雪崩 就齐了。）
 > 2. 互斥锁版释放锁用的是直接 `DEL lock`。设想：赢家查得特别慢、超过锁的 5s 自动过期，锁先自己没了 → 别人趁机抢到新锁；这时第一个赢家终于查完、一 `DEL`，删掉的是**别人**的锁。怎么修？（提示：锁的 value 放一个只有自己知道的随机令牌，删之前先核对是不是自己的——这正是 **V5 手搓分布式锁**要解决的第一刀。）
 > 3. 逻辑过期版永不设 Redis TTL，热点 key **永远占内存**。冷门 key 也这么干行不行？什么样的 key 才配用逻辑过期这套重武器？
+
+
+## V6：RDB vs AOF 持久化 —— 数据能回来，服务仍会中断
+
+V5 把缓存雪崩和分布式锁处理得更可靠，但那些方案都有一个共同前提：Redis 进程还活着。Redis 的主要工作集在内存里，`SET` 返回成功只说明写进了当前进程的内存，并不自动等于“机器重启后还能回来”。
+
+这一版不直接杀掉日常使用的 6379 实例，而是在临时目录、随机端口启动三个真实 Redis 子进程，再用 `SIGKILL` 制造突然崩溃。我们会亲眼看到无持久化、RDB 和 AOF 的恢复边界。
+
+### 示例代码
+
+```python
+"""
+V6 · RDB vs AOF：Redis 进程崩溃后，数据到底能不能回来
+
+V5 已经让缓存面对并发时更稳，但 Redis 仍然把主要数据放在内存里。进程一旦崩溃，
+没有落盘的数据就会消失。V6 用三个隔离的真实 Redis 实例依次演示：
+
+    1. 不开启持久化：崩溃重启后，刚写入的数据全部消失；
+    2. RDB：快照之前的数据回来，快照之后的新数据丢失；
+    3. AOF everysec：已刷盘的写命令会被重放，数据可以恢复。
+
+脚本不会修改或停止日常使用的 6379 实例。每个实验都在临时目录、随机端口启动
+独立 redis-server，结束后自动清理。
+
+运行：
+    .venv/bin/python src/v06_rdb_aof.py
+
+观察重点：
+    1. 内存里曾经 GET 到的数据，为什么重启后可能不存在？
+    2. RDB 恢复的是哪个时间点，为什么快照后的 key 会丢？
+    3. AOF 保存的是“写命令”而不是“内存照片”，重启时如何恢复数据？
+    4. 持久化能让数据回来，但 Redis 重启期间，客户端还能正常服务吗？
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+import redis
+
+START_TIMEOUT_SECONDS = 5
+AOF_FSYNC_TIMEOUT_MS = 5000
+
+
+def find_free_port() -> int:
+    """向操作系统申请一个当前空闲端口，避免碰到日常使用的 6379。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class IsolatedRedis:
+    """管理一个只服务于当前实验的 redis-server 子进程。"""
+
+    def __init__(self, workdir: Path, mode: str):
+        self.workdir = workdir
+        self.mode = mode
+        self.port = find_free_port()
+        self.process: subprocess.Popen | None = None
+        self.workdir.mkdir(parents=True, exist_ok=True)
+
+        executable = shutil.which("redis-server")
+        if executable is None:
+            raise RuntimeError("找不到 redis-server，请先安装 Redis 并确认它在 PATH 中")
+        self.executable = executable
+
+    def command(self) -> list[str]:
+        appendonly = "yes" if self.mode == "aof" else "no"
+        return [
+            self.executable,
+            "--port", str(self.port),
+            "--bind", "127.0.0.1",
+            "--protected-mode", "no",
+            "--daemonize", "no",
+            "--dir", str(self.workdir),
+            "--dbfilename", "dump.rdb",
+            "--save", "",  # 关闭自动快照；RDB 实验会在明确的位置手动 SAVE。
+            "--appendonly", appendonly,
+            "--appendfsync", "everysec",
+            "--appenddirname", "appendonlydir",
+            "--loglevel", "warning",
+            "--logfile", str(self.workdir / "redis.log"),
+        ]
+
+    def start(self) -> redis.Redis:
+        self.process = subprocess.Popen(
+            self.command(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        client = redis.Redis(host="127.0.0.1", port=self.port, decode_responses=True)
+        deadline = time.monotonic() + START_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                log = (self.workdir / "redis.log").read_text(errors="replace")
+                raise RuntimeError(f"隔离 Redis 启动失败：\n{log}")
+            try:
+                if client.ping():
+                    return client
+            except redis.ConnectionError:
+                time.sleep(0.05)
+        self.stop()
+        raise TimeoutError(f"Redis 在 {START_TIMEOUT_SECONDS}s 内没有启动完成")
+
+    def crash(self) -> None:
+        """使用 SIGKILL 模拟突然崩溃，避免正常 SHUTDOWN 偷偷补一次落盘。"""
+        if self.process is None or self.process.poll() is not None:
+            return
+        os.kill(self.process.pid, signal.SIGKILL)
+        self.process.wait(timeout=START_TIMEOUT_SECONDS)
+        self.process = None
+
+    def stop(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=START_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=START_TIMEOUT_SECONDS)
+        finally:
+            self.process = None
+
+
+def part_a_no_persistence(root: Path) -> None:
+    print("=" * 72)
+    print("Part A · 只有内存：写成功，不等于崩溃后还存在")
+    print("=" * 72)
+    server = IsolatedRedis(root / "no-persistence", mode="none")
+    try:
+        client = server.start()
+        client.set("order:20260723", "paid")
+        print("崩溃前 GET order:20260723 ->", client.get("order:20260723"))
+
+        server.crash()
+        client = server.start()
+        recovered = client.get("order:20260723")
+        print("崩溃重启后                  ->", recovered)
+        assert recovered is None
+        print("结论：没有持久化文件，内存数据随进程一起消失。")
+    finally:
+        server.stop()
+
+
+def part_b_rdb(root: Path) -> None:
+    print("\n" + "=" * 72)
+    print("Part B · RDB：恢复一张旧照片，而不是崩溃前的每次写入")
+    print("=" * 72)
+    server = IsolatedRedis(root / "rdb", mode="rdb")
+    try:
+        client = server.start()
+        client.set("product:1001", "snapshot-version")
+        client.save()  # 把这个明确时刻作为恢复边界，实验结果才是确定的。
+        rdb_path = server.workdir / "dump.rdb"
+        print(f"执行 SAVE，生成 dump.rdb（{rdb_path.stat().st_size} bytes）")
+
+        client.set("product:1002", "written-after-snapshot")
+        print("快照后又写入 product:1002，随后立刻模拟崩溃")
+        server.crash()
+
+        client = server.start()
+        before = client.get("product:1001")
+        after = client.get("product:1002")
+        print("重启后，快照前的 product:1001 ->", before)
+        print("重启后，快照后的 product:1002 ->", after)
+        assert before == "snapshot-version"
+        assert after is None
+        print("结论：RDB 恢复速度快，但两次快照之间的新写入可能丢失。")
+    finally:
+        server.stop()
+
+
+def part_c_aof(root: Path) -> None:
+    print("\n" + "=" * 72)
+    print("Part C · AOF everysec：把写命令落盘，重启时重新播放")
+    print("=" * 72)
+    server = IsolatedRedis(root / "aof", mode="aof")
+    try:
+        client = server.start()
+        client.set("inventory:1001", "99")
+
+        # everysec 理论上可能丢最近约 1 秒；WAITAOF 把演示边界钉在“本地已刷盘”。
+        local_fsynced, replicas_fsynced = client.execute_command(
+            "WAITAOF", 1, 0, AOF_FSYNC_TIMEOUT_MS
+        )
+        print(
+            "WAITAOF ->",
+            f"本地已刷盘={local_fsynced}, 副本已刷盘={replicas_fsynced}",
+        )
+        assert local_fsynced == 1
+
+        aof_files = sorted((server.workdir / "appendonlydir").glob("*"))
+        print("AOF 文件 ->", ", ".join(path.name for path in aof_files))
+        server.crash()
+
+        client = server.start()
+        recovered = client.get("inventory:1001")
+        print("崩溃重启后 GET inventory:1001 ->", recovered)
+        assert recovered == "99"
+        print("结论：Redis 重放 AOF 中的写命令，恢复出崩溃前已刷盘的数据。")
+    finally:
+        server.stop()
+
+
+def main() -> None:
+    print("V6 使用随机端口启动隔离 Redis；不会改动 127.0.0.1:6379。\n")
+    with tempfile.TemporaryDirectory(prefix="redis-v6-") as temp_dir:
+        root = Path(temp_dir)
+        part_a_no_persistence(root)
+        part_b_rdb(root)
+        part_c_aof(root)
+
+    print("\n" + "-" * 72)
+    print("V6 收口")
+    print("-" * 72)
+    print("RDB：周期性拍内存快照，文件紧凑、恢复快，但可能丢快照间隔内的数据。")
+    print("AOF：记录写命令，数据更完整；文件更大，恢复时需要重放命令。")
+    print("混合持久化：用 RDB 做基底、AOF 保存增量，是二者的工程折中。")
+    print("\n思考题（带着这些进 V7）：")
+    print("1. 数据可以从磁盘恢复，但 Redis 从崩溃到重启期间，请求由谁处理？")
+    print("2. 如果准备一个副本，主节点挂了以后，客户端怎样知道该连接谁？")
+    print("3. 主从复制是异步的；主刚写完就宕机，新主一定拥有最后那次写入吗？")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 运行示例
+
+```
+$ .venv/bin/python src/v06_rdb_aof.py
+V6 使用随机端口启动隔离 Redis；不会改动 127.0.0.1:6379。
+
+========================================================================
+Part A · 只有内存：写成功，不等于崩溃后还存在
+========================================================================
+崩溃前 GET order:20260723 -> paid
+崩溃重启后                  -> None
+结论：没有持久化文件，内存数据随进程一起消失。
+
+========================================================================
+Part B · RDB：恢复一张旧照片，而不是崩溃前的每次写入
+========================================================================
+执行 SAVE，生成 dump.rdb（124 bytes）
+快照后又写入 product:1002，随后立刻模拟崩溃
+重启后，快照前的 product:1001 -> snapshot-version
+重启后，快照后的 product:1002 -> None
+结论：RDB 恢复速度快，但两次快照之间的新写入可能丢失。
+
+========================================================================
+Part C · AOF everysec：把写命令落盘，重启时重新播放
+========================================================================
+WAITAOF -> 本地已刷盘=1, 副本已刷盘=0
+AOF 文件 -> appendonly.aof.1.base.rdb, appendonly.aof.1.incr.aof, appendonly.aof.manifest
+崩溃重启后 GET inventory:1001 -> 99
+结论：Redis 重放 AOF 中的写命令，恢复出崩溃前已刷盘的数据。
+
+------------------------------------------------------------------------
+V6 收口
+------------------------------------------------------------------------
+RDB：周期性拍内存快照，文件紧凑、恢复快，但可能丢快照间隔内的数据。
+AOF：记录写命令，数据更完整；文件更大，恢复时需要重放命令。
+混合持久化：用 RDB 做基底、AOF 保存增量，是二者的工程折中。
+
+思考题（带着这些进 V7）：
+1. 数据可以从磁盘恢复，但 Redis 从崩溃到重启期间，请求由谁处理？
+2. 如果准备一个副本，主节点挂了以后，客户端怎样知道该连接谁？
+3. 主从复制是异步的；主刚写完就宕机，新主一定拥有最后那次写入吗？
+```
+
+### 原理以及特点
+
+**RDB 保存的是某个时间点的内存快照。** Redis 通常通过后台 `BGSAVE` 派生子进程，借助操作系统的 Copy-on-Write 生成临时快照，完成后再原子替换 `dump.rdb`。文件紧凑、恢复快，适合备份和快速重启；代价是两次快照之间的新写入可能丢失。本实验用阻塞式 `SAVE` 故意钉住恢复边界：`product:1001` 在快照中，所以能回来；`product:1002` 写在快照后，所以崩溃后消失。生产环境通常用 `BGSAVE`，不会在请求路径直接执行 `SAVE`。
+
+**AOF 保存的是写命令。** Redis 每收到一次修改，就把对应命令追加到 AOF；重启时重新执行这些命令来重建内存。常见刷盘策略是 `always`、`everysec`、`no`：越频繁刷盘，丢数据窗口越小，但写入开销越高。项目使用 `everysec`，理论上突然断电时可能丢最近约 1 秒；实验通过 `WAITAOF` 明确等到本地刷盘后再崩溃，因此恢复结果是确定的。
+
+Redis 8 的 AOF 已经不是单个无限增长的文本文件。本次真实输出中的三个文件分别承担：
+
+| 文件 | 作用 |
+|---|---|
+| `appendonly.aof.1.base.rdb` | 重写时生成的紧凑基底，采用 RDB 格式 |
+| `appendonly.aof.1.incr.aof` | 基底之后新增的写命令 |
+| `appendonly.aof.manifest` | 记录加载顺序与当前有效文件 |
+
+这就是混合持久化的直观形态：RDB 负责快速恢复大块历史状态，增量 AOF 补上后续写入。AOF 开启时，Redis 重启会优先按 AOF 恢复，因为它通常比单独的 RDB 更新。
+
+当前本机 6379 的真实配置是：RDB 自动快照规则为 `3600 1 / 300 100 / 60 10000`，AOF 关闭，落盘目录是 `/opt/homebrew/var/db/redis`。也就是说，它当前偏向“恢复快、允许丢失最近一段写入”的缓存型选择。
+
+- **RDB 优点**：文件小、适合备份、全量恢复快，对正常写入的持续开销较低。
+- **RDB 缺点**：恢复点比较粗；生成快照需要 fork，在大内存实例上会产生 CPU、内存和延迟压力。
+- **AOF 优点**：数据丢失窗口更小，写入历史更细，`everysec` 是常见折中。
+- **AOF 缺点**：文件和持续 I/O 通常更多，需要重写；恢复增量命令也有成本。
+- **边界**：持久化不是高可用，也不是数据库备份的替代品。它解决“重启后数据能不能回来”，不解决“Redis 挂着的这段时间谁接请求”。
+
+> 思考题（带着这些进 V7）：
+> 1. 磁盘文件完好，但 Redis 进程宕机 30 秒，这 30 秒内客户端连接谁？
+> 2. 准备一个实时副本后，主节点挂了，谁负责判断故障、选择新主并通知客户端？
+> 3. 主从复制通常是异步的。如果主节点刚确认一次写入就宕机，新主是否一定拥有这次写入？
+
+
+## V7：主从复制 + Sentinel 自动故障转移 —— 数据有人接班
+
+V6 解决的是“Redis 重启后数据能不能回来”，但从进程崩溃到重启完成之间，客户端仍然没有服务可用。V7 把问题从“数据能否恢复”推进到“故障期间谁来接班”：提前运行副本，让它持续复制主节点；再用 Sentinel 监控故障、选择新主，并让客户端重新发现主节点。
+
+本版用六个隔离进程把三件事放到一个真实现场里：1 个主节点、2 个副本、3 个 Sentinel。脚本只杀掉临时主节点，不碰日常使用的 6379；由于所有进程仍在同一台 Mac 上，本实验模拟的是 Redis 进程故障，不是整台物理机断电。
+
+### 示例代码
+
+```python
+"""
+V7 · 主从复制 + Sentinel 自动故障转移
+
+V6 解决了“Redis 重启后数据能不能回来”，但节点从崩溃到恢复期间仍然无法服务。
+V7 提前准备两个副本，再用三个 Sentinel 自动完成三件事：
+
+    1. 多个 Sentinel 达到 quorum 后，确认旧主客观下线；
+    2. 选出负责人，把一个数据较新的副本提升为新主；
+    3. Sentinel-aware 客户端重新发现新主并继续写入。
+
+脚本会在临时目录和随机端口启动 1 主 + 2 副本 + 3 Sentinel，真实 SIGKILL
+旧主，再观察故障转移。它不会修改或停止日常使用的 127.0.0.1:6379。
+
+运行：
+    .venv/bin/python src/v07_sentinel_failover.py
+
+观察重点：
+    1. 写入主节点后，两个副本是否都复制到了数据？
+    2. 旧主崩溃后，Sentinel 多久发现并提升了哪个副本？
+    3. 客户端为什么不需要写死新主端口，也能继续写入？
+    4. 旧主恢复后为什么变成新主的副本，而不是抢回主节点身份？
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable
+
+import redis
+from redis.sentinel import MasterNotFoundError, Sentinel
+
+HOST = "127.0.0.1"
+MASTER_NAME = "mymaster"
+QUORUM = 2
+DOWN_AFTER_MS = 1000
+START_TIMEOUT_SECONDS = 5
+FAILOVER_TIMEOUT_SECONDS = 20
+
+
+def allocate_ports(count: int) -> list[int]:
+    """一次占住多个临时端口，避免六个进程意外拿到重复端口。"""
+    sockets: list[socket.socket] = []
+    try:
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind((HOST, 0))
+            sockets.append(sock)
+        return [sock.getsockname()[1] for sock in sockets]
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def wait_until(
+    description: str,
+    predicate: Callable[[], bool],
+    timeout: float,
+) -> None:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            if predicate():
+                return
+        except (redis.RedisError, OSError) as exc:
+            last_error = exc
+        time.sleep(0.05)
+    detail = f"，最后错误：{last_error}" if last_error else ""
+    raise TimeoutError(f"等待超时：{description}{detail}")
+
+
+class RedisNode:
+    """一个隔离的 Redis 数据节点，可作为主节点或副本启动。"""
+
+    def __init__(
+        self,
+        executable: str,
+        workdir: Path,
+        name: str,
+        port: int,
+        replica_of: tuple[str, int] | None = None,
+    ):
+        self.executable = executable
+        self.workdir = workdir / name
+        self.name = name
+        self.port = port
+        self.replica_of = replica_of
+        self.process: subprocess.Popen | None = None
+        self.workdir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def log_path(self) -> Path:
+        return self.workdir / "redis.log"
+
+    def command(self) -> list[str]:
+        command = [
+            self.executable,
+            "--port", str(self.port),
+            "--bind", HOST,
+            "--protected-mode", "no",
+            "--daemonize", "no",
+            "--dir", str(self.workdir),
+            "--save", "",  # V7 只观察高可用；持久化已经在 V6 单独验证。
+            "--appendonly", "no",
+            "--loglevel", "notice",
+            "--logfile", str(self.log_path),
+        ]
+        if self.replica_of is not None:
+            host, port = self.replica_of
+            command.extend(["--replicaof", host, str(port)])
+        return command
+
+    def client(self) -> redis.Redis:
+        return redis.Redis(
+            host=HOST,
+            port=self.port,
+            decode_responses=True,
+            socket_connect_timeout=0.5,
+            socket_timeout=0.5,
+        )
+
+    def start(self) -> None:
+        self.process = subprocess.Popen(
+            self.command(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        def ready() -> bool:
+            if self.process is not None and self.process.poll() is not None:
+                log = self.log_path.read_text(errors="replace")
+                raise RuntimeError(f"{self.name} 启动失败：\n{log}")
+            return bool(self.client().ping())
+
+        wait_until(f"{self.name} 启动", ready, START_TIMEOUT_SECONDS)
+
+    def crash(self) -> None:
+        """SIGKILL 模拟进程突然死亡，不给节点执行优雅退出的机会。"""
+        if self.process is None or self.process.poll() is not None:
+            return
+        os.kill(self.process.pid, signal.SIGKILL)
+        self.process.wait(timeout=START_TIMEOUT_SECONDS)
+        self.process = None
+
+    def stop(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=START_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=START_TIMEOUT_SECONDS)
+        finally:
+            self.process = None
+
+
+class SentinelNode:
+    """一个独立 Sentinel 进程；配置文件必须可写，因为 Sentinel 会持久化拓扑。"""
+
+    def __init__(
+        self,
+        executable: str,
+        workdir: Path,
+        name: str,
+        port: int,
+        master_port: int,
+    ):
+        self.executable = executable
+        self.workdir = workdir / name
+        self.name = name
+        self.port = port
+        self.master_port = master_port
+        self.process: subprocess.Popen | None = None
+        self.workdir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def config_path(self) -> Path:
+        return self.workdir / "sentinel.conf"
+
+    @property
+    def log_path(self) -> Path:
+        return self.workdir / "sentinel.log"
+
+    def write_config(self) -> None:
+        self.config_path.write_text(
+            "\n".join([
+                f"port {self.port}",
+                f"bind {HOST}",
+                "protected-mode no",
+                "daemonize no",
+                f"dir {self.workdir}",
+                f"logfile {self.log_path}",
+                f"sentinel monitor {MASTER_NAME} {HOST} {self.master_port} {QUORUM}",
+                f"sentinel down-after-milliseconds {MASTER_NAME} {DOWN_AFTER_MS}",
+                f"sentinel failover-timeout {MASTER_NAME} 10000",
+                f"sentinel parallel-syncs {MASTER_NAME} 1",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+
+    def client(self) -> redis.Redis:
+        return redis.Redis(
+            host=HOST,
+            port=self.port,
+            decode_responses=True,
+            socket_connect_timeout=0.5,
+            socket_timeout=0.5,
+        )
+
+    def start(self) -> None:
+        self.write_config()
+        self.process = subprocess.Popen(
+            [self.executable, str(self.config_path), "--sentinel"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        def ready() -> bool:
+            if self.process is not None and self.process.poll() is not None:
+                log = self.log_path.read_text(errors="replace")
+                raise RuntimeError(f"{self.name} 启动失败：\n{log}")
+            return bool(self.client().ping())
+
+        wait_until(f"{self.name} 启动", ready, START_TIMEOUT_SECONDS)
+
+    def stop(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=START_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=START_TIMEOUT_SECONDS)
+        finally:
+            self.process = None
+
+
+def replication_info(node: RedisNode) -> dict:
+    return node.client().info("replication")
+
+
+def sentinel_peer_count(node: SentinelNode) -> int:
+    peers = node.client().execute_command("SENTINEL", "SENTINELS", MASTER_NAME)
+    return len(peers)
+
+
+def relevant_sentinel_events(nodes: list[SentinelNode]) -> list[str]:
+    """从真实日志中抽出故障转移骨架，隐藏 PID、时间戳等随机噪声。"""
+    event_names = [
+        "+sdown",
+        "+odown",
+        "+elected-leader",
+        "+selected-slave",
+        "+promoted-slave",
+        "+switch-master",
+    ]
+    seen: set[str] = set()
+    for node in nodes:
+        log = node.log_path.read_text(errors="replace")
+        for event in event_names:
+            if event in log:
+                seen.add(event)
+    return [event for event in event_names if event in seen]
+
+
+def write_through_sentinel(client: redis.Redis, key: str, value: str) -> None:
+    """故障窗口内允许短暂失败；重试时连接池会重新向 Sentinel 发现主节点。"""
+    deadline = time.monotonic() + FAILOVER_TIMEOUT_SECONDS
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            client.set(key, value)
+            return
+        except redis.RedisError as exc:
+            last_error = exc
+            time.sleep(0.1)
+    raise TimeoutError(f"客户端在故障转移后仍无法写入：{last_error}")
+
+
+def run_demo(root: Path, executable: str) -> None:
+    ports = allocate_ports(6)
+    master_port, replica_1_port, replica_2_port = ports[:3]
+    sentinel_ports = ports[3:]
+
+    master = RedisNode(executable, root, "master", master_port)
+    replicas = [
+        RedisNode(
+            executable,
+            root,
+            "replica-1",
+            replica_1_port,
+            replica_of=(HOST, master_port),
+        ),
+        RedisNode(
+            executable,
+            root,
+            "replica-2",
+            replica_2_port,
+            replica_of=(HOST, master_port),
+        ),
+    ]
+    sentinels = [
+        SentinelNode(executable, root, f"sentinel-{index}", port, master_port)
+        for index, port in enumerate(sentinel_ports, start=1)
+    ]
+    all_redis_nodes = [master, *replicas]
+
+    try:
+        print("=" * 72)
+        print("Part A · 1 主 + 2 副本：先准备好能接班的数据节点")
+        print("=" * 72)
+        master.start()
+        for replica in replicas:
+            replica.start()
+
+        wait_until(
+            "两个副本完成初始同步",
+            lambda: all(
+                replication_info(replica).get("master_link_status") == "up"
+                for replica in replicas
+            ),
+            START_TIMEOUT_SECONDS,
+        )
+
+        for sentinel_node in sentinels:
+            sentinel_node.start()
+        wait_until(
+            "三个 Sentinel 互相发现",
+            lambda: all(sentinel_peer_count(node) >= 2 for node in sentinels),
+            START_TIMEOUT_SECONDS,
+        )
+
+        sentinel = Sentinel(
+            [(HOST, port) for port in sentinel_ports],
+            socket_timeout=0.5,
+            decode_responses=True,
+        )
+        discovered_before = sentinel.discover_master(MASTER_NAME)
+        sentinel_master = sentinel.master_for(MASTER_NAME, socket_timeout=0.5)
+
+        print(f"主节点       -> {HOST}:{master_port}")
+        print(f"副本节点     -> {HOST}:{replica_1_port}, {HOST}:{replica_2_port}")
+        print(f"Sentinel     -> {', '.join(str(port) for port in sentinel_ports)}")
+        print(f"quorum       -> {QUORUM}")
+        print(f"客户端发现主 -> {discovered_before[0]}:{discovered_before[1]}")
+
+        key_before = "order:20260724"
+        sentinel_master.set(key_before, "paid-before-failover")
+        acknowledged = sentinel_master.wait(2, 3000)
+        replica_values = [replica.client().get(key_before) for replica in replicas]
+        print(f"写入 {key_before}，WAIT 确认副本数 -> {acknowledged}")
+        print(f"两个副本读到 -> {replica_values}")
+        assert acknowledged == 2
+        assert replica_values == ["paid-before-failover", "paid-before-failover"]
+
+        print("\n" + "=" * 72)
+        print("Part B · SIGKILL 旧主：Sentinel 判断、选主并重组复制关系")
+        print("=" * 72)
+        failover_started = time.monotonic()
+        master.crash()
+        print(f"旧主 {HOST}:{master_port} 已被 SIGKILL")
+
+        def discover_new_master() -> bool:
+            try:
+                return sentinel.discover_master(MASTER_NAME)[1] != master_port
+            except MasterNotFoundError:
+                return False
+
+        wait_until(
+            "Sentinel 完成故障转移",
+            discover_new_master,
+            FAILOVER_TIMEOUT_SECONDS,
+        )
+        discovered_after = sentinel.discover_master(MASTER_NAME)
+        failover_seconds = time.monotonic() - failover_started
+        new_master_port = discovered_after[1]
+        new_master = next(node for node in replicas if node.port == new_master_port)
+        remaining_replica = next(node for node in replicas if node.port != new_master_port)
+
+        wait_until(
+            "剩余副本改为复制新主",
+            lambda: (
+                replication_info(remaining_replica).get("master_port") == new_master_port
+                and replication_info(remaining_replica).get("master_link_status") == "up"
+            ),
+            FAILOVER_TIMEOUT_SECONDS,
+        )
+        events = relevant_sentinel_events(sentinels)
+        print("Sentinel 事件 ->", " -> ".join(events))
+        print(f"新主节点      -> {discovered_after[0]}:{new_master_port}")
+        print(f"故障转移耗时  -> {failover_seconds:.2f}s")
+        print(f"新主保留旧数据 -> {new_master.client().get(key_before)}")
+
+        print("\n" + "=" * 72)
+        print("Part C · 客户端重发现新主；旧主恢复后成为副本")
+        print("=" * 72)
+        key_after = "order:20260724:after"
+        write_through_sentinel(sentinel_master, key_after, "paid-after-failover")
+        new_master_client = new_master.client()
+        acknowledged = new_master_client.wait(1, 3000)
+        print(f"原 Sentinel 客户端继续写入 {key_after} -> 成功")
+        print(f"当前主节点中的值 -> {new_master_client.get(key_after)}")
+        print(f"剩余副本确认数   -> {acknowledged}")
+
+        master.start()
+        wait_until(
+            "恢复后的旧主被改造成新主的副本",
+            lambda: (
+                replication_info(master).get("role") == "slave"
+                and replication_info(master).get("master_port") == new_master_port
+                and replication_info(master).get("master_link_status") == "up"
+            ),
+            FAILOVER_TIMEOUT_SECONDS,
+        )
+        print(
+            f"旧主 {master_port} 恢复后的角色 -> replica，"
+            f"复制新主 {new_master_port}"
+        )
+        print(f"恢复后的旧主读到新数据 -> {master.client().get(key_after)}")
+
+    finally:
+        for sentinel_node in sentinels:
+            sentinel_node.stop()
+        for node in all_redis_nodes:
+            node.stop()
+
+
+def main() -> None:
+    executable = shutil.which("redis-server")
+    if executable is None:
+        raise RuntimeError("找不到 redis-server，请先安装 Redis 并确认它在 PATH 中")
+
+    print("V7 使用随机端口启动 6 个隔离进程；不会改动 127.0.0.1:6379。\n")
+    with tempfile.TemporaryDirectory(prefix="redis-v7-") as temp_dir:
+        run_demo(Path(temp_dir), executable)
+
+    print("\n" + "-" * 72)
+    print("V7 收口")
+    print("-" * 72)
+    print("主从复制：提前准备拥有相近数据的副本，但默认是异步复制。")
+    print("Sentinel：确认故障、选出新主、维护新拓扑，并供客户端发现当前主节点。")
+    print("客户端：连接 Sentinel-aware 代理，不把主节点端口写死在业务代码中。")
+    print("边界：故障转移不是零中断；异步复制也不保证最后一次写入绝不丢失。")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 运行示例
+
+```
+$ .venv/bin/python src/v07_sentinel_failover.py
+V7 使用随机端口启动 6 个隔离进程；不会改动 127.0.0.1:6379。
+
+========================================================================
+Part A · 1 主 + 2 副本：先准备好能接班的数据节点
+========================================================================
+主节点       -> 127.0.0.1:51096
+副本节点     -> 127.0.0.1:51097, 127.0.0.1:51098
+Sentinel     -> 51099, 51100, 51101
+quorum       -> 2
+客户端发现主 -> 127.0.0.1:51096
+写入 order:20260724，WAIT 确认副本数 -> 2
+两个副本读到 -> ['paid-before-failover', 'paid-before-failover']
+
+========================================================================
+Part B · SIGKILL 旧主：Sentinel 判断、选主并重组复制关系
+========================================================================
+旧主 127.0.0.1:51096 已被 SIGKILL
+Sentinel 事件 -> +sdown -> +odown -> +elected-leader -> +selected-slave -> +promoted-slave -> +switch-master
+新主节点      -> 127.0.0.1:51098
+故障转移耗时  -> 2.35s
+新主保留旧数据 -> paid-before-failover
+
+========================================================================
+Part C · 客户端重发现新主；旧主恢复后成为副本
+========================================================================
+原 Sentinel 客户端继续写入 order:20260724:after -> 成功
+当前主节点中的值 -> paid-after-failover
+剩余副本确认数   -> 1
+旧主 51096 恢复后的角色 -> replica，复制新主 51098
+恢复后的旧主读到新数据 -> paid-after-failover
+
+------------------------------------------------------------------------
+V7 收口
+------------------------------------------------------------------------
+主从复制：提前准备拥有相近数据的副本，但默认是异步复制。
+Sentinel：确认故障、选出新主、维护新拓扑，并供客户端发现当前主节点。
+客户端：连接 Sentinel-aware 代理，不把主节点端口写死在业务代码中。
+边界：故障转移不是零中断；异步复制也不保证最后一次写入绝不丢失。
+```
+
+### 原理以及特点
+
+**主从复制先把“接班的数据”准备好。** 主节点接收写入，再把复制流发送给两个副本。副本默认只读，并持续保持自己的内存状态接近主节点。本实验先写入 `order:20260724`，再用 `WAIT 2 3000` 等待两个副本确认，确保后续杀主时这条数据已经存在于副本中。这里的 `WAIT` 只确认副本已经收到并处理写入，不等于磁盘持久化，也不能把 Redis 变成强一致数据库。
+
+**Sentinel 是独立的控制进程，不转发业务数据。** 三个 Sentinel 持续探测主节点；一个 Sentinel 先记录 `+sdown`（主观下线），达到 quorum=2 后形成 `+odown`（客观下线）。随后 Sentinel 之间选出故障转移负责人，选择合适的副本，发送 `REPLICAOF NO ONE` 将它提升为新主，并让其他副本改为复制新主。真实日志里的事件链正好对应这条因果链：`+sdown → +odown → +elected-leader → +selected-slave → +promoted-slave → +switch-master`。
+
+**客户端通过服务发现而不是固定端口连接主节点。** `redis-py` 的 `Sentinel(...).master_for("mymaster")` 会先向 Sentinel 询问当前主节点地址，然后直接连接 Redis 主节点。故障转移后，原来的客户端对象在连接失败时重新发现新主，因此业务代码不需要把 `51098` 写死。Sentinel 自己不是代理，正常读写不会经过 Sentinel 转发。
+
+旧主恢复时不会抢回主节点身份。Sentinel 会把它重新配置成新主的副本，等待复制追平；这是为了避免旧主和新主同时接受写入形成脑裂。
+
+| 组件 | 负责什么 | 不负责什么 |
+|---|---|---|
+| 主节点 | 接受写入、提供当前服务 | 不能独自保证故障后继续服务 |
+| 副本 | 提前复制数据、准备接班 | 默认不会自动决定自己成为主 |
+| Sentinel | 探测、判断故障、选主、维护拓扑、提供发现 | 不保存业务数据、不代理业务请求 |
+| Sentinel-aware 客户端 | 询问当前主并在故障后重连 | 不会让已经失败的旧连接继续可用 |
+
+- **高可用不是零中断**：本实验的故障转移耗时约 2.35 秒；真实时间受 `down-after-milliseconds`、选举和重连策略影响。
+- **异步复制有数据窗口**：主节点已经向客户端返回成功、但写入尚未到达副本时，如果主节点马上故障，新主可能缺少最后一次写入。
+- **副本读可能是旧数据**：Sentinel 不自动做负载均衡；如果应用主动读副本，需要接受复制延迟，强一致读仍应访问主节点。
+- **副本不是备份**：错误的 `DEL` 也会被同步；RDB/AOF 仍然负责持久化和备份边界。
+- **部署要跨故障域**：三个 Sentinel 和多个 Redis 节点如果全在同一台机器上，只能防进程故障，防不了整机断电。
+
+V7 的完整心智模型是：
+
+```
+主节点接收写入
+      ↓ 异步复制到副本
+Sentinel 持续探测主节点
+      ↓
+quorum 达成，确认 ODOWN
+      ↓
+选择副本并提升为新主
+      ↓
+客户端重新向 Sentinel 查询主地址
+      ↓
+连接新主继续服务
+```
+
+到这里，Redis 专题原先规划的 V1–V7 主线已经闭合：V1–V5 解决缓存和锁的运行期问题，V6 解决单节点重启后的数据恢复，V7 解决单节点故障后的自动接班。
