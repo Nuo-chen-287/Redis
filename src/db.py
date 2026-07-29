@@ -73,6 +73,26 @@ def query_product(product_id: int) -> dict | None:
         conn.close()               # 归还连接给池子（不是真的关闭）
 
 
+def update_product_price(product_id: int, new_price: int) -> None:
+    """更新商品价格并提交事务；缓存如何处理由调用方决定。"""
+    conn = _pool.connection()
+    try:
+        with conn.cursor() as cur:
+            updated = cur.execute(
+                "UPDATE product SET price = %s WHERE id = %s",
+                (new_price, product_id),
+            )
+        if updated != 1:
+            conn.rollback()
+            raise LookupError(f"商品 {product_id} 不存在")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_query_count() -> int:
     return _query_count
 

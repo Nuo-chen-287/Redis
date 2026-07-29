@@ -8,6 +8,9 @@ V7 提前准备两个副本，再用三个 Sentinel 自动完成三件事：
     2. 选出负责人，把一个数据较新的副本提升为新主；
     3. Sentinel-aware 客户端重新发现新主并继续写入。
 
+本版还会故意暂停并断开两个副本，在主节点已经向客户端返回成功、但写入尚未
+复制出去的窗口杀死主节点。故障转移后，新主将缺少这次已确认的写入。
+
 脚本会在临时目录和随机端口启动 1 主 + 2 副本 + 3 Sentinel，真实 SIGKILL
 旧主，再观察故障转移。它不会修改或停止日常使用的 127.0.0.1:6379。
 
@@ -16,9 +19,10 @@ V7 提前准备两个副本，再用三个 Sentinel 自动完成三件事：
 
 观察重点：
     1. 写入主节点后，两个副本是否都复制到了数据？
-    2. 旧主崩溃后，Sentinel 多久发现并提升了哪个副本？
-    3. 客户端为什么不需要写死新主端口，也能继续写入？
-    4. 旧主恢复后为什么变成新主的副本，而不是抢回主节点身份？
+    2. SET 已经返回成功，但 WAIT=0 时，故障转移后这条数据还在吗？
+    3. 旧主崩溃后，Sentinel 多久发现并提升了哪个副本？
+    4. WAIT 能缩小数据丢失窗口，为什么仍不能把 Redis 变成强一致数据库？
+    5. 旧主恢复后为什么变成新主的副本，而不是抢回主节点身份？
 """
 
 from __future__ import annotations
@@ -40,8 +44,9 @@ HOST = "127.0.0.1"
 MASTER_NAME = "mymaster"
 QUORUM = 2
 DOWN_AFTER_MS = 1000
-START_TIMEOUT_SECONDS = 5
+START_TIMEOUT_SECONDS = 10
 FAILOVER_TIMEOUT_SECONDS = 20
+REPLICA_ACK_TIMEOUT_MS = 200
 
 
 def allocate_ports(count: int) -> list[int]:
@@ -93,6 +98,7 @@ class RedisNode:
         self.port = port
         self.replica_of = replica_of
         self.process: subprocess.Popen | None = None
+        self.paused = False
         self.workdir.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -148,10 +154,26 @@ class RedisNode:
         os.kill(self.process.pid, signal.SIGKILL)
         self.process.wait(timeout=START_TIMEOUT_SECONDS)
         self.process = None
+        self.paused = False
+
+    def pause(self) -> None:
+        """冻结副本，稳定制造它无法继续处理复制流的窗口。"""
+        if self.process is None or self.process.poll() is not None:
+            raise RuntimeError(f"{self.name} 尚未运行，无法暂停")
+        os.kill(self.process.pid, signal.SIGSTOP)
+        self.paused = True
+
+    def resume(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        os.kill(self.process.pid, signal.SIGCONT)
+        self.paused = False
 
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
             return
+        if self.paused:
+            self.resume()
         self.process.terminate()
         try:
             self.process.wait(timeout=START_TIMEOUT_SECONDS)
@@ -160,6 +182,7 @@ class RedisNode:
             self.process.wait(timeout=START_TIMEOUT_SECONDS)
         finally:
             self.process = None
+            self.paused = False
 
 
 class SentinelNode:
@@ -317,7 +340,7 @@ def run_demo(root: Path, executable: str) -> None:
 
     try:
         print("=" * 72)
-        print("Part A · 1 主 + 2 副本：先准备好能接班的数据节点")
+        print("Part A · WAIT 写入：先确认两个副本都拥有安全数据")
         print("=" * 72)
         master.start()
         for replica in replicas:
@@ -364,11 +387,42 @@ def run_demo(root: Path, executable: str) -> None:
         assert replica_values == ["paid-before-failover", "paid-before-failover"]
 
         print("\n" + "=" * 72)
-        print("Part B · SIGKILL 旧主：Sentinel 判断、选主并重组复制关系")
+        print("Part B · 制造复制延迟：SET 成功不等于副本已经收到")
+        print("=" * 72)
+        for replica in replicas:
+            replica.pause()
+
+        # 先断开复制连接，避免命令已经进入本机 socket 缓冲区后才杀主，
+        # 让“副本没有收到这次写入”成为确定结果，而不是依赖机器快慢。
+        disconnected = master.client().execute_command(
+            "CLIENT", "KILL", "TYPE", "REPLICA"
+        )
+        wait_until(
+            "主节点确认两个复制连接都已断开",
+            lambda: replication_info(master).get("connected_slaves") == 0,
+            START_TIMEOUT_SECONDS,
+        )
+
+        key_at_risk = "order:20260724:at-risk"
+        set_result = sentinel_master.set(key_at_risk, "paid-but-not-replicated")
+        at_risk_acknowledged = sentinel_master.wait(2, REPLICA_ACK_TIMEOUT_MS)
+        print(f"冻结副本并断开复制连接 -> {disconnected} 个")
+        print(f"主节点 SET {key_at_risk} 返回 -> {set_result}")
+        print(
+            f"WAIT 2 {REPLICA_ACK_TIMEOUT_MS} 确认副本数 -> "
+            f"{at_risk_acknowledged}"
+        )
+        assert set_result is True
+        assert at_risk_acknowledged == 0
+
+        print("\n" + "=" * 72)
+        print("Part C · SIGKILL 旧主：Sentinel 只能从落后的副本中选新主")
         print("=" * 72)
         failover_started = time.monotonic()
         master.crash()
         print(f"旧主 {HOST}:{master_port} 已被 SIGKILL")
+        for replica in replicas:
+            replica.resume()
 
         def discover_new_master() -> bool:
             try:
@@ -399,10 +453,15 @@ def run_demo(root: Path, executable: str) -> None:
         print("Sentinel 事件 ->", " -> ".join(events))
         print(f"新主节点      -> {discovered_after[0]}:{new_master_port}")
         print(f"故障转移耗时  -> {failover_seconds:.2f}s")
-        print(f"新主保留旧数据 -> {new_master.client().get(key_before)}")
+        safe_value = new_master.client().get(key_before)
+        lost_value = new_master.client().get(key_at_risk)
+        print(f"WAIT=2 的安全写入 -> {safe_value}")
+        print(f"WAIT=0 的窗口写入 -> {lost_value}")
+        assert safe_value == "paid-before-failover"
+        assert lost_value is None
 
         print("\n" + "=" * 72)
-        print("Part C · 客户端重发现新主；旧主恢复后成为副本")
+        print("Part D · 客户端重发现新主；旧主恢复后成为副本")
         print("=" * 72)
         key_after = "order:20260724:after"
         write_through_sentinel(sentinel_master, key_after, "paid-after-failover")
@@ -450,7 +509,9 @@ def main() -> None:
     print("主从复制：提前准备拥有相近数据的副本，但默认是异步复制。")
     print("Sentinel：确认故障、选出新主、维护新拓扑，并供客户端发现当前主节点。")
     print("客户端：连接 Sentinel-aware 代理，不把主节点端口写死在业务代码中。")
-    print("边界：故障转移不是零中断；异步复制也不保证最后一次写入绝不丢失。")
+    print("一致性：SET 返回只代表主节点执行成功，不代表副本已经收到。")
+    print("WAIT：能等待副本确认、缩小丢失窗口，但超时也不会撤销已经执行的写入。")
+    print("结论：Redis 主从复制默认是最终一致，不保证副本永远和主节点一样新。")
 
 
 if __name__ == "__main__":

@@ -36,7 +36,7 @@
 
 ## 学习路线总览
 
-整体顺序：**缓存三大问题（V2–V4）→ 分布式锁 / Redisson（V5）→ 持久化（V6）→ 高可用（V7）**。
+整体顺序：**缓存三大问题（V2–V4）→ 分布式锁 / Redisson（V5）→ 持久化（V6）→ 高可用与复制一致性（V7）→ 缓存一致性（V8）→ 企业级分层拦截（V9）**。
 
 | 版本 | 副标题 | 解决的痛点 | 新引出的痛点 |
 |------|--------|-----------|-------------|
@@ -46,7 +46,9 @@
 | **V4** | 互斥锁重建 | 只放一个请求重建 | 大量 key 同时失效 → **缓存雪崩** |
 | **V5** | 手搓分布式锁 ≈ Redisson | 简易锁的隐藏 bug | （锁做对了，转向底层运维） |
 | **V6** | RDB vs AOF 持久化 | 重启不丢数据 | 单点宕机服务仍会瘫 |
-| **V7** | 主从同步 + 哨兵 | 自动故障转移、读写分离 | （收尾：对比 Cluster 集群） |
+| **V7** | 主从同步 + 哨兵 | 自动故障转移，并看清异步复制的数据窗口 | Redis 与 MySQL 仍可能不一致 |
+| **V8** | 缓存一致性 | 正确处理 DB 与缓存的双写顺序和失败 | 单一缓存层仍挡不住所有流量 |
+| **V9** | 企业级分层拦截 | 限流、本地缓存、Redis、连接池与降级逐层保护 DB | （专题收尾） |
 
 ### 各版本详解
 
@@ -74,7 +76,13 @@
   - 解决：Redis 重启后内存数据全没的问题。搞懂 RDB（快照）、AOF（追加日志）的取舍、混合持久化与恢复行为。亲手 kill Redis 看数据丢没丢。
 
 - **V7 · 别单点：主从同步 + 哨兵自动故障转移**
-  - 解决：Redis 宕机期间整个服务瘫痪（单点故障）。本机起 1 主 2 从 + 3 哨兵，演示主从复制、读写分离；手动 kill 主节点，看哨兵自动选新主、服务自愈。最后对比 Cluster 集群方案。
+  - 解决：Redis 宕机期间整个服务瘫痪（单点故障）。本机起 1 主 2 从 + 3 哨兵，手动 kill 主节点，看哨兵自动选新主、服务自愈；再冻结副本制造复制延迟，验证异步副本不会永远和主节点一样新。
+
+- **V8 · 缓存一致性：DB 变了，缓存怎么办**
+  - 解决：补齐写路径，对比双写顺序、并发旧值回填和删除失败，最终形成可恢复的最终一致方案。
+
+- **V9 · 企业级分层拦截链路**
+  - 解决：让突发请求依次经过网关限流、本地缓存、Redis、连接池和熔断降级，用逐层计数看清每层到底拦住了什么。
 
 ---
 
@@ -976,7 +984,7 @@ Redis 8 的 AOF 已经不是单个无限增长的文本文件。本次真实输�
 
 V6 解决的是“Redis 重启后数据能不能回来”，但从进程崩溃到重启完成之间，客户端仍然没有服务可用。V7 把问题从“数据能否恢复”推进到“故障期间谁来接班”：提前运行副本，让它持续复制主节点；再用 Sentinel 监控故障、选择新主，并让客户端重新发现主节点。
 
-本版用六个隔离进程把三件事放到一个真实现场里：1 个主节点、2 个副本、3 个 Sentinel。脚本只杀掉临时主节点，不碰日常使用的 6379；由于所有进程仍在同一台 Mac 上，本实验模拟的是 Redis 进程故障，不是整台物理机断电。
+本版用六个隔离进程把高可用和复制一致性放到一个真实现场里：1 个主节点、2 个副本、3 个 Sentinel。脚本先用 `WAIT` 确认一条写入已经到达两个副本；再冻结并断开副本，制造“主节点已返回成功、副本却没有收到”的窗口，随后杀死主节点。脚本只操作临时随机端口，不碰日常使用的 6379；由于所有进程仍在同一台 Mac 上，本实验模拟的是 Redis 进程故障，不是整台物理机断电。
 
 ### 示例代码
 
@@ -991,6 +999,9 @@ V7 提前准备两个副本，再用三个 Sentinel 自动完成三件事：
     2. 选出负责人，把一个数据较新的副本提升为新主；
     3. Sentinel-aware 客户端重新发现新主并继续写入。
 
+本版还会故意暂停并断开两个副本，在主节点已经向客户端返回成功、但写入尚未
+复制出去的窗口杀死主节点。故障转移后，新主将缺少这次已确认的写入。
+
 脚本会在临时目录和随机端口启动 1 主 + 2 副本 + 3 Sentinel，真实 SIGKILL
 旧主，再观察故障转移。它不会修改或停止日常使用的 127.0.0.1:6379。
 
@@ -999,9 +1010,10 @@ V7 提前准备两个副本，再用三个 Sentinel 自动完成三件事：
 
 观察重点：
     1. 写入主节点后，两个副本是否都复制到了数据？
-    2. 旧主崩溃后，Sentinel 多久发现并提升了哪个副本？
-    3. 客户端为什么不需要写死新主端口，也能继续写入？
-    4. 旧主恢复后为什么变成新主的副本，而不是抢回主节点身份？
+    2. SET 已经返回成功，但 WAIT=0 时，故障转移后这条数据还在吗？
+    3. 旧主崩溃后，Sentinel 多久发现并提升了哪个副本？
+    4. WAIT 能缩小数据丢失窗口，为什么仍不能把 Redis 变成强一致数据库？
+    5. 旧主恢复后为什么变成新主的副本，而不是抢回主节点身份？
 """
 
 from __future__ import annotations
@@ -1023,8 +1035,9 @@ HOST = "127.0.0.1"
 MASTER_NAME = "mymaster"
 QUORUM = 2
 DOWN_AFTER_MS = 1000
-START_TIMEOUT_SECONDS = 5
+START_TIMEOUT_SECONDS = 10
 FAILOVER_TIMEOUT_SECONDS = 20
+REPLICA_ACK_TIMEOUT_MS = 200
 
 
 def allocate_ports(count: int) -> list[int]:
@@ -1076,6 +1089,7 @@ class RedisNode:
         self.port = port
         self.replica_of = replica_of
         self.process: subprocess.Popen | None = None
+        self.paused = False
         self.workdir.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -1131,10 +1145,26 @@ class RedisNode:
         os.kill(self.process.pid, signal.SIGKILL)
         self.process.wait(timeout=START_TIMEOUT_SECONDS)
         self.process = None
+        self.paused = False
+
+    def pause(self) -> None:
+        """冻结副本，稳定制造它无法继续处理复制流的窗口。"""
+        if self.process is None or self.process.poll() is not None:
+            raise RuntimeError(f"{self.name} 尚未运行，无法暂停")
+        os.kill(self.process.pid, signal.SIGSTOP)
+        self.paused = True
+
+    def resume(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        os.kill(self.process.pid, signal.SIGCONT)
+        self.paused = False
 
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
             return
+        if self.paused:
+            self.resume()
         self.process.terminate()
         try:
             self.process.wait(timeout=START_TIMEOUT_SECONDS)
@@ -1143,6 +1173,7 @@ class RedisNode:
             self.process.wait(timeout=START_TIMEOUT_SECONDS)
         finally:
             self.process = None
+            self.paused = False
 
 
 class SentinelNode:
@@ -1300,7 +1331,7 @@ def run_demo(root: Path, executable: str) -> None:
 
     try:
         print("=" * 72)
-        print("Part A · 1 主 + 2 副本：先准备好能接班的数据节点")
+        print("Part A · WAIT 写入：先确认两个副本都拥有安全数据")
         print("=" * 72)
         master.start()
         for replica in replicas:
@@ -1347,11 +1378,42 @@ def run_demo(root: Path, executable: str) -> None:
         assert replica_values == ["paid-before-failover", "paid-before-failover"]
 
         print("\n" + "=" * 72)
-        print("Part B · SIGKILL 旧主：Sentinel 判断、选主并重组复制关系")
+        print("Part B · 制造复制延迟：SET 成功不等于副本已经收到")
+        print("=" * 72)
+        for replica in replicas:
+            replica.pause()
+
+        # 先断开复制连接，避免命令已经进入本机 socket 缓冲区后才杀主，
+        # 让“副本没有收到这次写入”成为确定结果，而不是依赖机器快慢。
+        disconnected = master.client().execute_command(
+            "CLIENT", "KILL", "TYPE", "REPLICA"
+        )
+        wait_until(
+            "主节点确认两个复制连接都已断开",
+            lambda: replication_info(master).get("connected_slaves") == 0,
+            START_TIMEOUT_SECONDS,
+        )
+
+        key_at_risk = "order:20260724:at-risk"
+        set_result = sentinel_master.set(key_at_risk, "paid-but-not-replicated")
+        at_risk_acknowledged = sentinel_master.wait(2, REPLICA_ACK_TIMEOUT_MS)
+        print(f"冻结副本并断开复制连接 -> {disconnected} 个")
+        print(f"主节点 SET {key_at_risk} 返回 -> {set_result}")
+        print(
+            f"WAIT 2 {REPLICA_ACK_TIMEOUT_MS} 确认副本数 -> "
+            f"{at_risk_acknowledged}"
+        )
+        assert set_result is True
+        assert at_risk_acknowledged == 0
+
+        print("\n" + "=" * 72)
+        print("Part C · SIGKILL 旧主：Sentinel 只能从落后的副本中选新主")
         print("=" * 72)
         failover_started = time.monotonic()
         master.crash()
         print(f"旧主 {HOST}:{master_port} 已被 SIGKILL")
+        for replica in replicas:
+            replica.resume()
 
         def discover_new_master() -> bool:
             try:
@@ -1382,10 +1444,15 @@ def run_demo(root: Path, executable: str) -> None:
         print("Sentinel 事件 ->", " -> ".join(events))
         print(f"新主节点      -> {discovered_after[0]}:{new_master_port}")
         print(f"故障转移耗时  -> {failover_seconds:.2f}s")
-        print(f"新主保留旧数据 -> {new_master.client().get(key_before)}")
+        safe_value = new_master.client().get(key_before)
+        lost_value = new_master.client().get(key_at_risk)
+        print(f"WAIT=2 的安全写入 -> {safe_value}")
+        print(f"WAIT=0 的窗口写入 -> {lost_value}")
+        assert safe_value == "paid-before-failover"
+        assert lost_value is None
 
         print("\n" + "=" * 72)
-        print("Part C · 客户端重发现新主；旧主恢复后成为副本")
+        print("Part D · 客户端重发现新主；旧主恢复后成为副本")
         print("=" * 72)
         key_after = "order:20260724:after"
         write_through_sentinel(sentinel_master, key_after, "paid-after-failover")
@@ -1433,7 +1500,9 @@ def main() -> None:
     print("主从复制：提前准备拥有相近数据的副本，但默认是异步复制。")
     print("Sentinel：确认故障、选出新主、维护新拓扑，并供客户端发现当前主节点。")
     print("客户端：连接 Sentinel-aware 代理，不把主节点端口写死在业务代码中。")
-    print("边界：故障转移不是零中断；异步复制也不保证最后一次写入绝不丢失。")
+    print("一致性：SET 返回只代表主节点执行成功，不代表副本已经收到。")
+    print("WAIT：能等待副本确认、缩小丢失窗口，但超时也不会撤销已经执行的写入。")
+    print("结论：Redis 主从复制默认是最终一致，不保证副本永远和主节点一样新。")
 
 
 if __name__ == "__main__":
@@ -1447,32 +1516,40 @@ $ .venv/bin/python src/v07_sentinel_failover.py
 V7 使用随机端口启动 6 个隔离进程；不会改动 127.0.0.1:6379。
 
 ========================================================================
-Part A · 1 主 + 2 副本：先准备好能接班的数据节点
+Part A · WAIT 写入：先确认两个副本都拥有安全数据
 ========================================================================
-主节点       -> 127.0.0.1:51096
-副本节点     -> 127.0.0.1:51097, 127.0.0.1:51098
-Sentinel     -> 51099, 51100, 51101
+主节点       -> 127.0.0.1:53653
+副本节点     -> 127.0.0.1:53654, 127.0.0.1:53655
+Sentinel     -> 53656, 53657, 53658
 quorum       -> 2
-客户端发现主 -> 127.0.0.1:51096
+客户端发现主 -> 127.0.0.1:53653
 写入 order:20260724，WAIT 确认副本数 -> 2
 两个副本读到 -> ['paid-before-failover', 'paid-before-failover']
 
 ========================================================================
-Part B · SIGKILL 旧主：Sentinel 判断、选主并重组复制关系
+Part B · 制造复制延迟：SET 成功不等于副本已经收到
 ========================================================================
-旧主 127.0.0.1:51096 已被 SIGKILL
-Sentinel 事件 -> +sdown -> +odown -> +elected-leader -> +selected-slave -> +promoted-slave -> +switch-master
-新主节点      -> 127.0.0.1:51098
-故障转移耗时  -> 2.35s
-新主保留旧数据 -> paid-before-failover
+冻结副本并断开复制连接 -> 2 个
+主节点 SET order:20260724:at-risk 返回 -> True
+WAIT 2 200 确认副本数 -> 0
 
 ========================================================================
-Part C · 客户端重发现新主；旧主恢复后成为副本
+Part C · SIGKILL 旧主：Sentinel 只能从落后的副本中选新主
+========================================================================
+旧主 127.0.0.1:53653 已被 SIGKILL
+Sentinel 事件 -> +sdown -> +odown -> +elected-leader -> +selected-slave -> +promoted-slave -> +switch-master
+新主节点      -> 127.0.0.1:53654
+故障转移耗时  -> 2.26s
+WAIT=2 的安全写入 -> paid-before-failover
+WAIT=0 的窗口写入 -> None
+
+========================================================================
+Part D · 客户端重发现新主；旧主恢复后成为副本
 ========================================================================
 原 Sentinel 客户端继续写入 order:20260724:after -> 成功
 当前主节点中的值 -> paid-after-failover
 剩余副本确认数   -> 1
-旧主 51096 恢复后的角色 -> replica，复制新主 51098
+旧主 53653 恢复后的角色 -> replica，复制新主 53654
 恢复后的旧主读到新数据 -> paid-after-failover
 
 ------------------------------------------------------------------------
@@ -1481,12 +1558,38 @@ V7 收口
 主从复制：提前准备拥有相近数据的副本，但默认是异步复制。
 Sentinel：确认故障、选出新主、维护新拓扑，并供客户端发现当前主节点。
 客户端：连接 Sentinel-aware 代理，不把主节点端口写死在业务代码中。
-边界：故障转移不是零中断；异步复制也不保证最后一次写入绝不丢失。
+一致性：SET 返回只代表主节点执行成功，不代表副本已经收到。
+WAIT：能等待副本确认、缩小丢失窗口，但超时也不会撤销已经执行的写入。
+结论：Redis 主从复制默认是最终一致，不保证副本永远和主节点一样新。
 ```
 
 ### 原理以及特点
 
-**主从复制先把“接班的数据”准备好。** 主节点接收写入，再把复制流发送给两个副本。副本默认只读，并持续保持自己的内存状态接近主节点。本实验先写入 `order:20260724`，再用 `WAIT 2 3000` 等待两个副本确认，确保后续杀主时这条数据已经存在于副本中。这里的 `WAIT` 只确认副本已经收到并处理写入，不等于磁盘持久化，也不能把 Redis 变成强一致数据库。
+**主从复制先把“接班的数据”准备好。** 主节点接收写入，再把复制流发送给两个副本。副本默认只读，并持续保持自己的内存状态接近主节点。本实验先写入 `order:20260724`，再用 `WAIT 2 3000` 等待两个副本确认，确保后续杀主时这条数据已经存在于副本中。
+
+**异步复制不保证副本永远和主节点一样新。** 普通 `SET` 返回成功，只表示主节点已经执行命令；它不会等副本处理完同一条复制流。本实验冻结并断开两个副本后，`SET order:20260724:at-risk ...` 仍然返回 `True`，紧接着执行 `WAIT 2 200` 却只得到 `0`。这时杀掉主节点，Sentinel 只能从两个落后的副本中选主，所以新主保留了之前 `WAIT=2` 的数据，却查不到刚刚已经返回成功的窗口写入：
+
+```
+副本停止接收复制流
+        ↓
+主节点执行 SET，并向客户端返回成功
+        ↓
+WAIT 返回 0：没有副本确认这次复制位置
+        ↓
+主节点突然死亡
+        ↓
+Sentinel 提升一个落后的副本
+        ↓
+客户端成功过、但只存在于旧主内存里的写入丢失
+```
+
+**`WAIT` 缩小丢失窗口，但不提供强一致。** `WAIT 2 3000` 表示等待两个副本确认当前连接此前写入对应的复制位置，最多等 3000ms；返回值是实际确认数量。它有三个必须记住的边界：
+
+- 超时返回数量不足时，主节点上的写入**不会回滚**，业务必须自己决定重试、报错还是接受风险。
+- 副本确认的是已接收并处理复制流，不代表数据已经刷入副本磁盘；磁盘持久化是 V6 的另一层问题。
+- 即使已有副本确认，同时故障、网络分区和选主边界仍然存在；Redis 主从复制因此仍是最终一致模型，不会因为调用 `WAIT` 就变成多数派提交的强一致系统。
+
+生产环境还能配置 `min-replicas-to-write` 和 `min-replicas-max-lag`：当主节点观察不到足够多、延迟处在阈值内的副本时，主动拒绝新的写入。这能避免主节点在“一个可用副本都没有”的状态下继续积累风险数据，但它检查的是副本近期是否在线，不是每条写入都完成多数派提交，所以同样只是降低 RPO，而不是消灭数据丢失窗口。
 
 **Sentinel 是独立的控制进程，不转发业务数据。** 三个 Sentinel 持续探测主节点；一个 Sentinel 先记录 `+sdown`（主观下线），达到 quorum=2 后形成 `+odown`（客观下线）。随后 Sentinel 之间选出故障转移负责人，选择合适的副本，发送 `REPLICAOF NO ONE` 将它提升为新主，并让其他副本改为复制新主。真实日志里的事件链正好对应这条因果链：`+sdown → +odown → +elected-leader → +selected-slave → +promoted-slave → +switch-master`。
 
@@ -1501,8 +1604,8 @@ Sentinel：确认故障、选出新主、维护新拓扑，并供客户端发现
 | Sentinel | 探测、判断故障、选主、维护拓扑、提供发现 | 不保存业务数据、不代理业务请求 |
 | Sentinel-aware 客户端 | 询问当前主并在故障后重连 | 不会让已经失败的旧连接继续可用 |
 
-- **高可用不是零中断**：本实验的故障转移耗时约 2.35 秒；真实时间受 `down-after-milliseconds`、选举和重连策略影响。
-- **异步复制有数据窗口**：主节点已经向客户端返回成功、但写入尚未到达副本时，如果主节点马上故障，新主可能缺少最后一次写入。
+- **高可用不是零中断**：本次实测故障转移耗时约 2.26 秒；真实时间受 `down-after-milliseconds`、选举和重连策略影响。
+- **异步复制有数据窗口**：本实验已经真实验证，主节点返回成功后仍可能得到 `WAIT=0`，故障转移后新主缺少该写入。
 - **副本读可能是旧数据**：Sentinel 不自动做负载均衡；如果应用主动读副本，需要接受复制延迟，强一致读仍应访问主节点。
 - **副本不是备份**：错误的 `DEL` 也会被同步；RDB/AOF 仍然负责持久化和备份边界。
 - **部署要跨故障域**：三个 Sentinel 和多个 Redis 节点如果全在同一台机器上，只能防进程故障，防不了整机断电。
@@ -1523,4 +1626,467 @@ quorum 达成，确认 ODOWN
 连接新主继续服务
 ```
 
-到这里，Redis 专题原先规划的 V1–V7 主线已经闭合：V1–V5 解决缓存和锁的运行期问题，V6 解决单节点重启后的数据恢复，V7 解决单节点故障后的自动接班。
+到这里，Redis 自身的可靠性链路已经闭合：V6 负责单节点重启后的数据恢复，V7 负责节点故障后的自动接班，同时明确异步复制只能提供最终一致。下一版把视角从 Redis 内部移到应用数据：MySQL 已经更新时，Redis 里的旧缓存该怎么办？
+
+> 思考题（带着这些进 V8）：
+> 1. 商品库存已经在 MySQL 从 100 改成 99，但 Redis 仍缓存 100，读请求究竟应该相信谁？
+> 2. 同时写 MySQL 和 Redis 时，如果第一步成功、第二步失败，换一下执行顺序就能消灭问题吗？
+> 3. MySQL 与 Redis 是两个独立系统，无法直接共享一个本地事务时，我们能追求的是强一致，还是可恢复的最终一致？
+
+---
+
+## V8：缓存一致性
+
+### Part A：只更新 DB，制造脏缓存基线
+
+V2 建立了完整的 Cache-Aside 读路径，却一直没有处理写操作。只要商品数据永远不变，这条读路径就没有问题；一旦后台修改了 MySQL，Redis 里已经缓存的旧对象并不会收到通知。
+
+Part A 先采用最省事、也最不可靠的写法：**只更新权威数据源 MySQL，完全不处理 Redis**。这一部分故意把缓存 TTL 缩短到 4 秒，让“不一致窗口”能在一次运行中完整显形。生产缓存如果设置 10 分钟 TTL，同一个问题就可能持续 10 分钟。
+
+### 示例代码
+
+```python
+"""
+V8 · 缓存一致性 · Part A：只更新 DB，故意制造脏缓存（真实 Redis + 真实 MySQL）
+
+V2 已有完整读路径，但没有写路径。本版先采用最省事的写法：商品价格只更新 MySQL，
+完全不处理 Redis。这样能建立缓存一致性的坏基线，亲眼看到两个系统同时保存不同价格。
+
+运行前：
+    .venv/bin/python src/db.py
+    redis-cli ping
+然后：
+    .venv/bin/python src/v08_cache_consistency.py
+
+观察重点：
+    1. MySQL 已经变成新价格后，业务读取为什么仍返回旧价格？
+    2. 脏数据会持续多久？TTL 到期后为什么又自动一致了？
+    3. TTL 能兜底最终一致，为什么仍不能替代主动处理缓存？
+"""
+
+import json
+import time
+
+import cache
+import db
+
+PRODUCT_ID = 1001
+CACHE_TTL = 4  # 实验只等 4 秒；生产 TTL 往往更长，脏数据窗口也会随之变长。
+KEY_PREFIX = "consistency:product:"
+
+
+def cache_key(product_id: int) -> str:
+    return f"{KEY_PREFIX}{product_id}"
+
+
+def get_product(product_id: int) -> dict | None:
+    """沿用 V2 的 Cache-Aside 读路径。"""
+    key = cache_key(product_id)
+    cached = cache.r.get(key)
+    if cached is not None:
+        return json.loads(cached)
+
+    product = db.query_product(product_id)
+    if product is not None:
+        cache.r.set(key, json.dumps(product), ex=CACHE_TTL)
+    return product
+
+
+def update_price_db_only(product_id: int, new_price: int) -> None:
+    """Part A 故意只改权威数据源，不碰缓存。"""
+    db.update_product_price(product_id, new_price)
+
+
+def wait_for_cache_expiry(key: str) -> None:
+    while cache.r.exists(key):
+        time.sleep(0.05)
+
+
+def main() -> None:
+    original = db.query_product(PRODUCT_ID)
+    if original is None:
+        raise RuntimeError(f"商品 {PRODUCT_ID} 不存在，请先运行 .venv/bin/python src/db.py")
+
+    key = cache_key(PRODUCT_ID)
+    old_price = original["price"]
+    new_price = old_price + 100
+
+    try:
+        cache.r.delete(key)
+        db.reset_query_count()
+
+        print("=" * 68)
+        print("阶段 1 · 预热缓存：MySQL 与 Redis 目前一致")
+        print("=" * 68)
+        warmed = get_product(PRODUCT_ID)
+        print(f"MySQL 商品价格      -> {old_price}")
+        print(f"首次业务读取        -> {warmed['price']}（cache miss，回源并写入 Redis）")
+        print(f"Redis TTL           -> {cache.r.ttl(key)} 秒")
+        print(f"DB 查询次数         -> {db.get_query_count()}")
+
+        print("\n" + "=" * 68)
+        print("阶段 2 · 只更新 MySQL：缓存开始变脏")
+        print("=" * 68)
+        update_price_db_only(PRODUCT_ID, new_price)
+        authoritative = db.query_product(PRODUCT_ID)
+        stale = get_product(PRODUCT_ID)
+        print(f"MySQL 最新价格      -> {authoritative['price']}")
+        print(f"业务接口读取        -> {stale['price']}（cache hit，仍是旧值）")
+        print(f"Redis 剩余 TTL      -> {cache.r.ttl(key)} 秒")
+        print(f"DB 查询次数         -> {db.get_query_count()}（业务读取命中缓存，没有回源）")
+        assert authoritative["price"] == new_price
+        assert stale["price"] == old_price
+
+        print("\n" + "=" * 68)
+        print("阶段 3 · 等 TTL 到期：下一次读取才恢复一致")
+        print("=" * 68)
+        wait_for_cache_expiry(key)
+        fresh = get_product(PRODUCT_ID)
+        print(f"缓存到期后的读取    -> {fresh['price']}（cache miss，重新查询 MySQL）")
+        print(f"DB 查询次数         -> {db.get_query_count()}")
+        assert fresh["price"] == new_price
+
+        print("\n结论：只更新 DB 只能依赖 TTL 最终一致；TTL 有多长，旧值最多就可能暴露多久。")
+    finally:
+        db.update_product_price(PRODUCT_ID, old_price)
+        cache.r.delete(key)
+        print(f"实验清理：MySQL 价格已恢复为 {old_price}，实验缓存已删除。")
+
+    print("\n思考题（带着这些进 Part B）：")
+    print("1. 更新 DB 后立刻删除缓存，能不能把脏数据窗口从 4 秒缩短到下一次读取？")
+    print("2. 为什么业界通常选择删除缓存，而不是再写一遍缓存？")
+    print("3. 如果先删除缓存、再更新 DB，中间恰好进来一个读请求，它会回填什么值？")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 运行示例
+
+```text
+$ .venv/bin/python src/v08_cache_consistency.py
+====================================================================
+阶段 1 · 预热缓存：MySQL 与 Redis 目前一致
+====================================================================
+MySQL 商品价格      -> 1899
+首次业务读取        -> 1899（cache miss，回源并写入 Redis）
+Redis TTL           -> 4 秒
+DB 查询次数         -> 1
+
+====================================================================
+阶段 2 · 只更新 MySQL：缓存开始变脏
+====================================================================
+MySQL 最新价格      -> 1999
+业务接口读取        -> 1899（cache hit，仍是旧值）
+Redis 剩余 TTL      -> 4 秒
+DB 查询次数         -> 2（业务读取命中缓存，没有回源）
+
+====================================================================
+阶段 3 · 等 TTL 到期：下一次读取才恢复一致
+====================================================================
+缓存到期后的读取    -> 1999（cache miss，重新查询 MySQL）
+DB 查询次数         -> 3
+
+结论：只更新 DB 只能依赖 TTL 最终一致；TTL 有多长，旧值最多就可能暴露多久。
+实验清理：MySQL 价格已恢复为 1899，实验缓存已删除。
+```
+
+### 原理以及特点
+
+缓存不是 MySQL 的自动副本。MySQL 执行 `UPDATE` 时只修改自己的数据页和事务日志，它不知道 Redis 里存在 `consistency:product:1001`；Redis 也不会主动监听 MySQL。因此写操作完成后，两个系统可以同时保存不同版本的数据。
+
+读请求仍然优先访问 Redis。只要旧 key 还存在，它就会在缓存命中分支直接返回，根本没有机会查询已经更新的 MySQL。TTL 到期后 key 被 Redis 删除，下一次读取才会 cache miss、回源并把新价格写回来。这属于**依赖过期时间兜底的最终一致**。
+
+- **优点**：写路径最简单；Redis 故障不会阻止 MySQL 更新；TTL 到期后最终能够自行恢复。
+- **缺点**：TTL 期间持续返回旧数据；TTL 越长，最坏不一致窗口越长；TTL 太短又会降低命中率、增加 DB 压力。
+- **适用场景**：能容忍较长延迟的弱一致数据，例如非关键推荐结果或低实时性配置。
+- **不适用场景**：价格、库存、权限、订单状态等用户会立即验证或涉及业务决策的数据。
+
+> 思考题（带着这些进 Part B）：
+> 1. 更新 DB 后立刻删除缓存，能否把脏数据窗口从“等 TTL”缩短成“等下一次读取”？
+> 2. 为什么 Cache-Aside 的写路径通常选择删除缓存，而不是同时更新缓存？
+> 3. 如果执行顺序变成“先删除缓存、再更新 DB”，两步之间进入的读请求会从 MySQL 读到新值还是旧值？
+
+### Part B：先更新 MySQL，再删除 Redis
+
+Part A 的问题是写路径只修改 MySQL，Redis 中的旧副本只能等待 TTL 自然过期。Part B 补齐 Cache-Aside 最常用的写策略：**先提交 MySQL 事务，再删除对应的缓存 key**。
+
+删除后，Redis 暂时没有这条商品数据。下一次读取按照原有 Cache-Aside 读路径回源 MySQL，拿到新值并重新缓存。因此我们不需要在写请求里构造、序列化并维护另一份商品对象。
+
+### 新增代码
+
+以下代码继续位于同一个 `src/v08_cache_consistency.py`：
+
+```python
+def update_price_db_then_delete(product_id: int, new_price: int) -> None:
+    """Part B：先提交权威数据，再删除可以重新生成的缓存副本。"""
+    db.update_product_price(product_id, new_price)
+    cache.r.delete(cache_key(product_id))
+
+
+def part_b_db_then_delete() -> None:
+    original = db.query_product(PRODUCT_ID)
+    if original is None:
+        raise RuntimeError(f"商品 {PRODUCT_ID} 不存在，请先运行 .venv/bin/python src/db.py")
+
+    key = cache_key(PRODUCT_ID)
+    old_price = original["price"]
+    new_price = old_price + 100
+
+    try:
+        cache.r.delete(key)
+        warmed = get_product(PRODUCT_ID)
+        db.reset_query_count()
+
+        print("\n" + "#" * 68)
+        print("Part B · 更新 MySQL，再删除 Redis")
+        print("#" * 68)
+        print(f"更新前业务读取      -> {warmed['price']}（旧值已在 Redis）")
+        print(f"更新前缓存存在      -> {cache.r.exists(key)}")
+
+        update_price_db_then_delete(PRODUCT_ID, new_price)
+        print(f"MySQL 已更新        -> {new_price}")
+        print(f"更新后缓存存在      -> {cache.r.exists(key)}（DEL 已移除旧副本）")
+
+        first = get_product(PRODUCT_ID)
+        first_query_count = db.get_query_count()
+        second = get_product(PRODUCT_ID)
+        print(f"更新后第一次读取    -> {first['price']}（cache miss，回源新值）")
+        print(f"更新后第二次读取    -> {second['price']}（cache hit）")
+        print(f"两次读取的 DB 查询数 -> {db.get_query_count()}（只有第一次回源）")
+        assert first["price"] == new_price
+        assert second["price"] == new_price
+        assert first_query_count == 1
+        assert db.get_query_count() == 1
+
+        print("\n结论：先更新 DB 再删除缓存，把脏数据窗口缩短到了下一次读取重建缓存之前。")
+    finally:
+        db.update_product_price(PRODUCT_ID, old_price)
+        cache.r.delete(key)
+        print(f"实验清理：MySQL 价格已恢复为 {old_price}，实验缓存已删除。")
+```
+
+### 运行示例
+
+```text
+####################################################################
+Part B · 更新 MySQL，再删除 Redis
+####################################################################
+更新前业务读取      -> 1899（旧值已在 Redis）
+更新前缓存存在      -> 1
+MySQL 已更新        -> 1999
+更新后缓存存在      -> 0（DEL 已移除旧副本）
+更新后第一次读取    -> 1999（cache miss，回源新值）
+更新后第二次读取    -> 1999（cache hit）
+两次读取的 DB 查询数 -> 1（只有第一次回源）
+
+结论：先更新 DB 再删除缓存，把脏数据窗口缩短到了下一次读取重建缓存之前。
+实验清理：MySQL 价格已恢复为 1899，实验缓存已删除。
+```
+
+### 原理以及特点
+
+必须先更新 DB，再删除缓存。`db.update_product_price()` 成功返回时 MySQL 事务已经提交；如果 DB 更新失败，代码不会执行后面的 `DEL`，原缓存仍然对应旧 DB 状态。如果顺序反过来，在 `DEL` 与数据库提交之间进入的读请求可能从旧 DB 读取数据，并把旧值重新写回缓存。
+
+选择删除而不是更新缓存还有一个并发优势。两个写请求直接更新缓存时，数据库提交顺序和 Redis 写入顺序可能相反，导致较早的值最后覆盖较新的值；两个写请求都执行 `DEL` 时，顺序无关紧要，最终状态都是“缓存不存在”。
+
+- **优点**：实现短；`DEL` 幂等；缓存按需重建；绝大多数业务使用这一方案已经足够。
+- **代价**：更新后的第一次读取会 cache miss，需要承担一次 DB 查询。
+- **一致性级别**：显著缩短脏数据窗口，但 MySQL 与 Redis 没有共享事务，因此仍不是强一致。
+
+这个方案还留有一条概率较低、但真实存在的并发时序：
+
+```text
+t1  读请求缓存未命中，开始查询旧 DB
+t2  写请求更新 DB 为新值
+t3  写请求删除缓存
+t4  更早的读请求才结束查询，把旧值写回缓存
+```
+
+此时旧值是在 `DEL` **之后**才被写回的，第一次删除自然清理不到它。延迟双删会在更新 DB 并第一次删除后等待一个覆盖正常读请求耗时的间隔，再执行第二次 `DEL`，尝试清走这种晚到的旧值。这是 Part C 要稳定复现并处理的痛点。
+
+延迟双删也不是最终保证：等待多久需要估算，进程可能在第二次删除前崩溃，Redis 故障也可能让两次删除都失败。因此后面仍要讨论可重试的缓存失效，而不是把 `sleep + DEL` 当成分布式事务。
+
+> 思考题（带着这些进 Part C）：
+> 1. 上述时序中，为什么读请求能够在 DB 更新前拿到旧值，却在 `DEL` 之后才写缓存？
+> 2. 第二次删除至少要晚于哪个动作，才能清掉旧值回填？
+> 3. 如果执行第二次删除的应用进程崩溃，谁来继续完成这次缓存失效？
+
+### Part C：旧值晚回填、延迟双删与删除重试
+
+Part B 的“更新 DB → 删除缓存”解决了绝大多数不一致，但第一次删除只能清理**当时已经存在**的 key。如果一个更早开始的读请求已经从旧 DB 拿到了数据，却在第一次 `DEL` 之后才执行缓存回填，旧值仍会重新出现在 Redis。
+
+Part C 用两个 `threading.Event` 固定这条并发顺序，不再依赖线程是否碰巧撞上：读线程拿到旧值后暂停；写线程更新 DB 并删除缓存；随后才允许读线程把旧值写回。确认旧值复活后，实验延迟 0.3 秒执行第二次删除，再由下一次读取回源新 DB。
+
+### 新增代码
+
+以下代码继续追加在同一个 `src/v08_cache_consistency.py`：
+
+```python
+def read_then_fill_late(
+    product_id: int,
+    db_read_done: threading.Event,
+    allow_cache_fill: threading.Event,
+    outcome: dict,
+) -> None:
+    """先读到旧 DB，再暂停到写请求删完缓存后才回填。"""
+    try:
+        product = db.query_product(product_id)
+        outcome["product"] = product
+        db_read_done.set()
+        if not allow_cache_fill.wait(timeout=5):
+            raise TimeoutError("等待晚回填信号超时")
+        if product is not None:
+            cache.r.set(cache_key(product_id), json.dumps(product), ex=CACHE_TTL)
+    except Exception as exc:
+        outcome["error"] = exc
+        db_read_done.set()
+
+
+def delete_cache_with_retry(key: str, delete_fn=cache.r.delete, attempts: int = 3) -> int:
+    """处理短暂 Redis 故障；返回实际执行到第几次才成功。"""
+    for attempt in range(1, attempts + 1):
+        try:
+            delete_fn(key)
+            return attempt
+        except redis.RedisError:
+            if attempt == attempts:
+                raise
+            time.sleep(0.05)
+    raise AssertionError("unreachable")
+
+
+def part_c_race_and_retry() -> None:
+    original = db.query_product(PRODUCT_ID)
+    if original is None:
+        raise RuntimeError(f"商品 {PRODUCT_ID} 不存在，请先运行 .venv/bin/python src/db.py")
+
+    key = cache_key(PRODUCT_ID)
+    old_price = original["price"]
+    new_price = old_price + 100
+
+    try:
+        print("\n" + "#" * 68)
+        print("Part C · 延迟双删 + 删除失败重试")
+        print("#" * 68)
+        cache.r.delete(key)
+
+        db_read_done = threading.Event()
+        allow_cache_fill = threading.Event()
+        outcome: dict = {}
+        reader = threading.Thread(
+            target=read_then_fill_late,
+            args=(PRODUCT_ID, db_read_done, allow_cache_fill, outcome),
+        )
+        reader.start()
+        if not db_read_done.wait(timeout=5):
+            raise TimeoutError("读请求没有完成 DB 查询")
+        if "error" in outcome:
+            raise outcome["error"]
+
+        print(f"慢读请求已从 MySQL 拿到 -> {outcome['product']['price']}，暂不回填")
+        update_price_db_then_delete(PRODUCT_ID, new_price)
+        print(f"写请求更新 MySQL 为 {new_price}，并完成第一次 DEL")
+        print(f"第一次 DEL 后缓存存在 -> {cache.r.exists(key)}")
+
+        allow_cache_fill.set()
+        reader.join(timeout=5)
+        if reader.is_alive():
+            raise TimeoutError("读请求没有完成晚回填")
+        if "error" in outcome:
+            raise outcome["error"]
+
+        resurrected = json.loads(cache.r.get(key))
+        print(f"慢读请求随后回填 Redis -> {resurrected['price']}（旧值在 DEL 后复活）")
+        assert resurrected["price"] == old_price
+
+        # ponytail: 阻塞等待只为固定演示顺序；生产环境应异步调度第二次删除。
+        time.sleep(DELAYED_DELETE_SECONDS)
+        cache.r.delete(key)
+        fresh = get_product(PRODUCT_ID)
+        print(f"延迟 {DELAYED_DELETE_SECONDS:.1f}s 第二次 DEL 后读取 -> {fresh['price']}")
+        assert fresh["price"] == new_price
+
+        print("\n删除失败实验：第一次 DEL 模拟连接中断，第二次重试成功")
+        db.update_product_price(PRODUCT_ID, old_price)
+        cache.r.delete(key)
+        get_product(PRODUCT_ID)
+        db.update_product_price(PRODUCT_ID, new_price)
+
+        calls = 0
+
+        def fail_once_then_delete(cache_key_: str) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                print("第 1 次 DEL          -> 模拟 Redis 连接失败")
+                raise redis.ConnectionError("simulated connection failure")
+            print("第 2 次 DEL          -> 重试成功")
+            return cache.r.delete(cache_key_)
+
+        # ponytail: 本地重试随进程崩溃而丢失；不能容忍时升级到 outbox、MQ 或 CDC。
+        succeeded_on = delete_cache_with_retry(key, delete_fn=fail_once_then_delete)
+        fresh_after_retry = get_product(PRODUCT_ID)
+        print(f"删除在第 {succeeded_on} 次成功，随后读取 -> {fresh_after_retry['price']}")
+        assert succeeded_on == 2
+        assert fresh_after_retry["price"] == new_price
+    finally:
+        db.update_product_price(PRODUCT_ID, old_price)
+        cache.r.delete(key)
+```
+
+### 运行示例
+
+```text
+####################################################################
+Part C · 延迟双删 + 删除失败重试
+####################################################################
+慢读请求已从 MySQL 拿到 -> 1899，暂不回填
+写请求更新 MySQL 为 1999，并完成第一次 DEL
+第一次 DEL 后缓存存在 -> 0
+慢读请求随后回填 Redis -> 1899（旧值在 DEL 后复活）
+延迟 0.3s 第二次 DEL 后读取 -> 1999
+
+删除失败实验：第一次 DEL 模拟连接中断，第二次重试成功
+第 1 次 DEL          -> 模拟 Redis 连接失败
+第 2 次 DEL          -> 重试成功
+删除在第 2 次成功，随后读取 -> 1999
+
+V8 收口：主方案是更新 DB 后删缓存；延迟双删缩小并发窗口；重试处理短暂失败。
+若不能接受进程崩溃导致失效任务丢失，需要把任务持久化到 outbox/MQ，或订阅 binlog。
+实验清理：MySQL 价格已恢复为 1899，实验缓存已删除。
+```
+
+### 原理以及特点
+
+`threading.Event` 不是一致性方案，只是实验中的时间控制器。`db_read_done` 保证读线程已经拿到旧价格，`allow_cache_fill` 则保证它必须等第一次 `DEL` 完成后才能回填。这样每次运行都会得到同一条因果链：**旧 DB 读取发生在更新前，旧缓存写入却发生在删除后**。
+
+延迟双删的第二次删除必须晚于旧读请求的回填，才有机会清掉复活的旧值。示例中的 0.3 秒只适合本机实验；生产环境通常参考接口的高分位 DB 查询耗时和回填耗时，并通过异步任务调度第二次删除，不能让请求线程长期 `sleep`。
+
+有限重试处理的是 Redis 短暂断连、超时等瞬时故障。由于 `DEL` 是幂等操作，同一个 key 删除多次不会破坏正确数据，因此失败后重试很自然。但本地循环仍有明确上限：应用进程如果在下一次重试前崩溃，内存里的任务随进程一起消失。
+
+不能容忍这种任务丢失时，需要把“让某个缓存 key 失效”变成可恢复事件：
+
+- **事务 outbox**：更新业务表和插入失效事件使用同一个 MySQL 事务，worker 删除成功后再标记事件完成。
+- **消息队列**：由消费者执行删除和重试；通常需要配合 outbox，避免 DB 提交成功但消息发送失败。
+- **binlog/Canal/CDC**：监听已经提交的数据库变更，再异步删除或刷新缓存，适合不容易统一改造所有写入口的系统。
+- **TTL**：仍然保留，作为所有主动失效手段都失败后的最后兜底。
+
+这些方案追求的是**可恢复的最终一致**，而不是让 MySQL 与 Redis 获得一个天然的跨系统原子事务。对于余额、最终库存扣减等不能容忍旧值参与决策的数据，不应把普通缓存读取当成最终正确性依据。
+
+V8 到这里形成完整链路：
+
+```text
+只更新 DB，旧缓存持续存在
+        ↓
+更新 DB 后 DEL，覆盖绝大多数场景
+        ↓
+延迟第二删，缩小旧读请求晚回填窗口
+        ↓
+失败重试，处理短暂 Redis 故障
+        ↓
+outbox / MQ / CDC，处理进程崩溃后的可靠恢复
+        ↓
+TTL 作为最后兜底
+```
